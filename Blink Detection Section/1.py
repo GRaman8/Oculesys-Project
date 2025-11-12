@@ -9,7 +9,7 @@ import os
 load_dotenv()
 
 # --- 1. SET YOUR MODE AND FILE PATH ---
-MODE = 'video' 
+MODE = 'webcam' 
 VIDEO_FILE_PATH = os.getenv("VIDEO_FILE_PATH") 
 
 # --- 2. SET TUNING PARAMETERS ---
