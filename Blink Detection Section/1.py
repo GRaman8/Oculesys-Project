@@ -3,8 +3,8 @@ import mediapipe as mp
 import numpy as np
 import time
 import csv
+import os
 from dotenv import load_dotenv
-import os  # <-- NEW: Added for file naming
 
 load_dotenv()
 
@@ -57,7 +57,7 @@ def main():
     )
 
     cap = None 
-    end_time = float('inf') # By default, run forever (for video mode)
+    end_time = float('inf') 
     
     if MODE == 'webcam':
         print("Searching for webcam...")
@@ -70,7 +70,6 @@ def main():
             print(f"Error: Could not find or open any webcam.")
             return
         
-        # --- NEW: WEBCAM TIMER (REQUEST 2) ---
         try:
             duration_min = float(input("Enter run duration in minutes (e.g., 0.5 for 30 seconds): "))
             end_time = time.time() + (duration_min * 60)
@@ -89,31 +88,32 @@ def main():
             return
         print("Processing video... Press 'q' in the window to stop.")
 
-    # --- 2. SET UP DYNAMIC CSV LOGGING (REQUEST 3) ---
+    # --- 2. SET UP DYNAMIC CSV LOGGING ---
     os.makedirs(LOG_DIRECTORY, exist_ok=True)
-
+    
     csv_file_name = ''
     if MODE == 'video':
-        # Create CSV name from video name (e.g., "my_vid.mp4" -> "my_vid_log.csv")
         base_name = os.path.basename(VIDEO_FILE_PATH)
         file_name_without_ext = os.path.splitext(base_name)[0]
         csv_file_name = f"{file_name_without_ext}_log.csv"
+        
     elif MODE == 'webcam':
-        # Find a unique name like "webcam_take_1.csv", "webcam_take_2.csv", etc.
         counter = 1
         csv_file_name = f"webcam_take_{counter}.csv"
-        while os.path.exists(csv_file_name):
+
+        while os.path.exists(os.path.join(LOG_DIRECTORY, csv_file_name)):
             counter += 1
             csv_file_name = f"webcam_take_{counter}.csv"
             
-    # --- NEW: Combine the directory and file name ---
-    csv_path = os.path.join(LOG_DIRECTORY, csv_file_name)        
+    csv_path = os.path.join(LOG_DIRECTORY, csv_file_name)
     print(f"Data will be saved to: {csv_path}")
 
+    # --- NEW: EXPANDED CSV HEADER ---
     csv_header = [
         'timestamp_sec', 'avg_ear', 'left_ear', 'right_ear', 'is_blinking_frame', 
         'closed_frame_counter', 'blink_count_total', 'blink_rate_bps',
-        'left_pupil_diameter', 'right_pupil_diameter'
+        'left_pupil_diameter', 'right_pupil_diameter',
+        'head_pitch', 'head_yaw', 'head_roll', 'nose_z' # <-- NEW ATTRIBUTES
     ]
     
     try:
@@ -125,18 +125,29 @@ def main():
         cap.release()
         return
 
-    # --- 3. SET UP COUNTERS AND TIMERS ---
+    # --- 3. SET UP COUNTERS, TIMERS, AND POSE MODEL ---
     blink_counter = 0
     closed_frame_counter = 0
     start_time = time.time()
     blinks_per_second = 0.0
     elapsed_time = 0.0
 
+    # --- NEW: 3D Model and Camera setup for Head Pose ---
+    model_points = np.array([
+        (0.0, 0.0, 0.0),             # Nose tip (Landmark 1)
+        (0.0, -330.0, -65.0),        # Chin (Landmark 152)
+        (-225.0, 170.0, -135.0),     # Left eye left corner (Landmark 263)
+        (225.0, 170.0, -135.0),      # Right eye right corner (Landmark 33)
+        (-150.0, -150.0, -125.0),    # Left Mouth corner (Landmark 287)
+        (150.0, -150.0, -125.0)      # Right mouth corner (Landmark 57)
+    ], dtype=np.float64)
+    
+    camera_matrix = None # Will be set on the first frame
+    dist_coeffs = np.zeros((4,1)) # Assume no lens distortion
+
     # --- 4. START PROCESSING LOOP ---
     try:
         while cap.isOpened():
-            
-            # --- NEW: Check for timer (webcam) or 'q' press (both) ---
             if time.time() > end_time:
                 print("Webcam duration complete.")
                 break
@@ -156,25 +167,70 @@ def main():
 
             img_h, img_w, _ = frame.shape
             
+            # --- NEW: Initialize Camera Matrix (once) ---
+            if camera_matrix is None:
+                focal_length = img_w
+                center = (img_w / 2, img_h / 2)
+                camera_matrix = np.array(
+                    [[focal_length, 0, center[0]],
+                     [0, focal_length, center[1]],
+                     [0, 0, 1]], dtype=np.float64
+                )
+
             # --- 5. MEDIAPIPE & BLINK LOGIC ---
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = face_mesh.process(rgb_frame)
 
+            # Reset metrics
             avg_ear = 0.0; left_ear = 0.0; right_ear = 0.0
             left_pupil_diameter = 0.0; right_pupil_diameter = 0.0
             is_blinking_now = 0
+            head_pitch = 0.0; head_yaw = 0.0; head_roll = 0.0; nose_z = 0.0 # <-- NEW
 
             if results.multi_face_landmarks:
                 face_landmarks = results.multi_face_landmarks[0]
                 landmarks = face_landmarks.landmark
                 has_iris_landmarks = len(landmarks) == 478 
                 
+                # --- NEW: Head Pose Estimation ---
+                try:
+                    # Get 2D image points
+                    image_points = np.array([
+                        (landmarks[1].x * img_w, landmarks[1].y * img_h),     # Nose tip
+                        (landmarks[152].x * img_w, landmarks[152].y * img_h),   # Chin
+                        (landmarks[263].x * img_w, landmarks[263].y * img_h),   # Left eye left corner
+                        (landmarks[33].x * img_w, landmarks[33].y * img_h),    # Right eye right corner
+                        (landmarks[287].x * img_w, landmarks[287].y * img_h),   # Left Mouth corner
+                        (landmarks[57].x * img_w, landmarks[57].y * img_h)     # Right mouth corner
+                    ], dtype=np.float64)
+                    
+                    # Solve PnP
+                    (success, rotation_vector, translation_vector) = cv2.solvePnP(
+                        model_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
+                    )
+                    
+                    # Convert rotation vector to angles (Pitch, Yaw, Roll)
+                    (rotation_matrix, _) = cv2.Rodrigues(rotation_vector)
+                    angles = cv2.RQDecomp3x3(rotation_matrix)[0]
+                    head_pitch = angles[0]
+                    head_yaw = angles[1]
+                    head_roll = angles[2]
+                    
+                    # Get nose z-coordinate (from 3D landmarks)
+                    nose_z = landmarks[1].z
+                    
+                except Exception as e:
+                    pass # Will fail if landmarks aren't detected
+                # --- End of Head Pose ---
+
+                # --- EAR Calculation ---
                 right_eye_points = [(landmarks[i].x * img_w, landmarks[i].y * img_h) for i in RIGHT_EYE_INDICES]
                 left_eye_points = [(landmarks[i].x * img_w, landmarks[i].y * img_h) for i in LEFT_EYE_INDICES]
                 left_ear = calculate_ear(left_eye_points)
                 right_ear = calculate_ear(right_eye_points)
                 avg_ear = (left_ear + right_ear) / 2.0
                 
+                # --- Pupil Diameter Calculation ---
                 if has_iris_landmarks:
                     try:
                         right_iris_points = [(landmarks[i].x * img_w, landmarks[i].y * img_h) for i in RIGHT_IRIS_INDICES]
@@ -184,6 +240,7 @@ def main():
                     except Exception as e:
                         left_pupil_diameter = 0.0; right_pupil_diameter = 0.0
                 
+                # --- Blink Counting ---
                 if avg_ear < EAR_THRESHOLD:
                     closed_frame_counter += 1
                     is_blinking_now = 1
@@ -198,25 +255,29 @@ def main():
             else: blinks_per_second = 0.0
 
             # --- 7. WRITE ENHANCED DATA TO CSV ---
+            # --- NEW: Expanded Data Row ---
             current_data_row = [
                 f"{elapsed_time:.3f}", f"{avg_ear:.4f}", f"{left_ear:.4f}", f"{right_ear:.4f}",
                 is_blinking_now, closed_frame_counter, blink_counter, f"{blinks_per_second:.4f}",
-                f"{left_pupil_diameter:.4f}", f"{right_pupil_diameter:.4f}"
+                f"{left_pupil_diameter:.4f}", f"{right_pupil_diameter:.4f}",
+                f"{head_pitch:.2f}", f"{head_yaw:.2f}", f"{head_roll:.2f}", f"{nose_z:.4f}" # <-- NEW
             ]
             writer.writerow(current_data_row)
 
-            # --- 8. DISPLAY RESULTS (REQUEST 1) ---
-            # This window now shows for BOTH video and webcam mode
+            # --- 8. DISPLAY RESULTS ---
             cv2.putText(frame, f"BLINKS: {blink_counter}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.putText(frame, f"EAR: {avg_ear:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.putText(frame, f"Blink Rate (B/s): {blinks_per_second:.2f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
-            # Add a timer display for webcam mode
             if MODE == 'webcam':
                 remaining_time = max(0, end_time - time.time())
                 cv2.putText(frame, f"Time Left: {int(remaining_time)}s", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-
+            # --- NEW: Display Head Pose ---
+            cv2.putText(frame, f"Pitch: {head_pitch:.2f}", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            cv2.putText(frame, f"Yaw: {head_yaw:.2f}", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            cv2.putText(frame, f"Roll: {head_roll:.2f}", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            
             cv2.imshow('Blink Detection Data Collection', frame)
     
     except Exception as e:
@@ -224,10 +285,10 @@ def main():
 
     finally:
         # --- 9. CLEANUP ---
-        if log_file:
+        if 'log_file' in locals() and not log_file.closed:
             log_file.close()
             print(f"--- Data Collection Complete ---")
-            print(f"Data saved to: {csv_file_name}")
+            print(f"Data saved to: {csv_path}")
         if cap:
             cap.release()
         cv2.destroyAllWindows()
