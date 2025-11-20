@@ -10,7 +10,7 @@ load_dotenv()
 
 # --- 1. SET YOUR MODE AND FILE PATH ---
 # Switch to 'webcam' or 'video'
-MODE = 'webcam' 
+MODE = 'video' 
 
 # Make sure this path is correct for video mode
 VIDEO_FILE_PATH = os.getenv("VIDEO_FILE_PATH") 
